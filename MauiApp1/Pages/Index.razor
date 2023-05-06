@@ -1,0 +1,244 @@
+﻿@page "/"
+@implements IDisposable
+@using Drastic.AudioRecorder;
+@using Whisper.net.Ggml;
+@using Whisper.net;
+@inject AudioRecorderService recordService
+@inject NavigationManager navigationManager
+@inject MauiApp1.Services.IDialogService dialogService
+<MudText Typo="Typo.h4" Align="Align.Center" class="mb-3">
+        Unofficial offline translate/transcribe using OpenAI Whisper
+</MudText>
+@if(whisperFactory is null)
+{
+    <MudText Typo="Typo.h5" Align="Align.Center" class="mb-3">
+        Select a model to download. Smallest is highly recommended. En suffix means it's for english only!
+    </MudText>
+    <MudSelect Dense="true" @bind-Value="@modelType" class="mb-3" Variant="Variant.Outlined">
+        @foreach (GgmlType item in Enum.GetValues(typeof(GgmlType)))
+        {
+            <MudSelectItem Value="@item">
+                <MudText Typo="Typo.h6" Align="Align.Center">@item</MudText>
+            </MudSelectItem>
+        }
+    </MudSelect>
+    <div class="d-flex justify-center">
+        <MudButton Color="Color.Primary" Variant="Variant.Outlined"
+            @onclick="async () => await DownloadModelAsync()">
+            @if (processing)
+            {
+                <MudProgressCircular Class="ms-n1" Size="Size.Small" Indeterminate="true"/>
+                <MudText Typo="Typo.h5" Align="Align.Center" class="pl-2">Processing</MudText>
+            }
+            else {
+                <MudText Typo="Typo.h5" Align="Align.Center">Download model</MudText>
+            }
+        </MudButton>
+    </div>
+}
+else
+{
+    <div class="justify-center">
+        <MudPaper Class="mb-3 pa-6" Elevation="3">
+            @if (string.IsNullOrEmpty(Text)){
+                <MudText Typo="Typo.h5" Align="Align.Center" class="mb-3">
+                    Transcribed text will appear here. Please be patient until processing is done!
+                </MudText>
+            }
+            else {
+                <MudText Typo="Typo.h5" Align="Align.Center" class="mb-3">
+                    @Text
+                </MudText>
+            }
+            <div class="d-flex justify-center">
+                <MudButton Color="Color.Primary" Variant="Variant.Outlined"
+                    @onclick="async () => await CopyTextAsync()">
+                    <MudText Typo="Typo.h5" Align="Align.Center">Copy</MudText>
+                </MudButton>
+            </div>
+        </MudPaper>
+        <MudButton Color="Color.Primary" class="mb-3" Variant="Variant.Outlined"
+            @onclick="async () => await StartRecordingAsync()">
+            @if (processing)
+            {
+                <MudProgressCircular Class="ms-n1" Size="Size.Small" Indeterminate="true"/>
+                <MudText Typo="Typo.h5" Align="Align.Center" class="pl-2">Processing</MudText>
+            }
+            else {
+                <MudText Typo="Typo.h5" Align="Align.Center">Record</MudText>
+            }
+        </MudButton>
+        <MudButton Color="Color.Primary" class="mb-3" Variant="Variant.Outlined"
+            @onclick="async () => await EndRecordingAsync()" Disabled="stopDisabled">
+            <MudText Typo="Typo.h5" Align="Align.Center">Stop recording</MudText>
+        </MudButton>
+        <MudButton Color="Color.Primary" class="mb-3" Variant="Variant.Outlined"
+            @onclick="Reset" Disabled="processing">
+            <MudText Typo="Typo.h5" Align="Align.Center">Redownload model</MudText>
+        </MudButton>
+        <MudButton Color="Color.Primary" class="mb-3" Variant="Variant.Outlined"
+            @onclick="async () => await UseFileAsync()" Disabled="processing">
+            <MudText Typo="Typo.h5" Align="Align.Center">Load a file</MudText>
+        </MudButton>
+        <MudSwitch Size="Size.Large" Disabled="processing" @bind-Checked="@translate" Label="Translate to english" Color="Color.Warning" />
+    </div>
+}
+<div class="d-flex justify-center mt-2">
+     <MudButton Color="Color.Primary" Variant="Variant.Outlined"
+         @onclick="async () => await BrowserOpenAsync()">
+          <MudText Typo="Typo.h5" Align="Align.Center">Official repository + LICENSE</MudText>
+     </MudButton>
+</div>
+@code{
+    private string ModelPath =
+      Path.Combine(FileSystem.Current.CacheDirectory, "model.bin");
+    private GgmlType modelType = GgmlType.Base;
+    private WhisperFactory whisperFactory;
+    private bool processing = false;
+    private string Text = string.Empty;
+    private bool stopDisabled = true;
+    private bool translate = false;
+
+    private async Task BrowserOpenAsync()
+    {
+        try
+        {
+            Uri uri = new Uri("https://github.com/openai/whisper");
+            await Browser.Default.OpenAsync(uri, BrowserLaunchMode.SystemPreferred);
+        }
+        catch (Exception e)
+        {
+            await dialogService.DisplayConfirmAsync("An error occurred!", e.Message);
+            throw;
+        }
+    }
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        if (File.Exists(ModelPath))
+        {
+            BuildFactory();
+        }
+    }
+    private void Reset(){
+        File.Delete(ModelPath);
+        navigationManager.NavigateTo("", true);
+    }
+    private async Task UseFileAsync(){
+        try
+        {
+            processing = true;
+            stopDisabled = true;
+            Text = string.Empty;
+            var customFileType = new FilePickerFileType(
+                new Dictionary<DevicePlatform, IEnumerable<string>>
+                {
+                    { DevicePlatform.iOS, new[] { "UTType.audio" } }, 
+                    { DevicePlatform.Android, new[] { "audio/x-wav" } }, 
+                    { DevicePlatform.WinUI, new[] { ".wav" } }, 
+                    { DevicePlatform.Tizen, new[] { "*/*" } },
+                    { DevicePlatform.macOS, new[] { ".wav" } }, 
+                });
+            var result = await FilePicker.PickAsync(new PickOptions
+                {
+                   FileTypes = customFileType,
+                   PickerTitle = "Pick a wav file"
+                });
+            using var strm = await result.OpenReadAsync();
+            using var processor = BuildProcessor();
+            await foreach (var item in processor.ProcessAsync(strm, CancellationToken.None))
+            {
+                Text += item.Text;
+                StateHasChanged();
+            }
+            processing = false;
+            stopDisabled = false;
+        }
+        catch (Exception e)
+        {
+            await dialogService.DisplayConfirmAsync("An error occurred!", e.Message);
+            throw;
+        }
+    }
+    private async Task CopyTextAsync()
+    {
+        await Clipboard.Default.SetTextAsync(Text);
+    }
+    private async Task StartRecordingAsync()
+    {
+        try
+        {
+            if (await RequestPermissionAsync())
+            {
+                processing = true;
+                recordService.FilePath = Path.Combine(FileSystem.Current.CacheDirectory, DateTime.UtcNow.Ticks + ".wav");
+                await recordService.StartRecording();
+                stopDisabled = false;
+            }
+        }
+        catch (Exception e)
+        {
+            await dialogService.DisplayConfirmAsync("An error occurred!", e.Message);
+            throw;
+        }
+    }
+    private async Task<bool> RequestPermissionAsync()
+    {
+        var status = await Permissions.RequestAsync<Permissions.Microphone>();
+        return status == PermissionStatus.Granted;
+    }
+    private WhisperProcessor BuildProcessor()
+    {
+        var builder = whisperFactory.CreateBuilder()
+                .WithLanguage("auto");
+        if (translate)
+        {
+            builder.WithTranslate();
+        }
+        return builder.Build();
+    }
+    private async Task EndRecordingAsync()
+    {
+        try
+        {
+            stopDisabled = true;
+            Text = string.Empty;
+            await recordService.StopRecording();
+            var strm = recordService.GetAudioFileStream();
+            using var processor = BuildProcessor();
+            await foreach (var item in processor.ProcessAsync(strm, CancellationToken.None))
+            {
+                Text += item.Text;
+                StateHasChanged();
+            }
+            await strm.DisposeAsync();
+            File.Delete(recordService.FilePath);
+            processing = false;
+        }
+        catch (Exception e)
+        {
+            await dialogService.DisplayConfirmAsync("An error occurred!", e.Message);
+            throw;
+        }
+
+    }
+    private void BuildFactory()
+    {
+        whisperFactory = WhisperFactory.FromPath(ModelPath);
+    }
+
+    public void Dispose()
+    {
+        whisperFactory.Dispose();
+    }
+    private async Task DownloadModelAsync()
+    {
+        processing = true;
+        using var modelStream = await WhisperGgmlDownloader.GetGgmlModelAsync(modelType);
+        var fileWriter = File.OpenWrite(ModelPath);
+        await modelStream.CopyToAsync(fileWriter);
+        await fileWriter.DisposeAsync();
+        BuildFactory();
+        processing = false;
+    }
+}
